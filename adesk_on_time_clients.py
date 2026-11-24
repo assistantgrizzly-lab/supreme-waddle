@@ -129,6 +129,7 @@ class ClientStats:
     name: str
     on_time: int = 0
     late: int = 0
+    paid: int = 0
     late_details: list[str] = field(default_factory=list)
 
     @property
@@ -182,6 +183,7 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
         if due is None:
             continue
         s = client_stats(cid, fallback)
+        s.paid += 1
         if tx_date <= due + grace:
             s.on_time += 1
         else:
@@ -190,18 +192,26 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
     return stats
 
 
-def env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    return float(raw) if raw not in (None, "") else default
+def resolve_option(parser: argparse.ArgumentParser, value: Any, env_name: str,
+                   default: Any, cast: Any) -> Any:
+    if value is not None:
+        return value
+    raw = os.getenv(env_name)
+    if raw in (None, ""):
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        parser.error(f"некорректное значение {env_name}={raw!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Клиенты Adesk, оплачивающие вовремя.")
-    parser.add_argument("--ratio", type=float, default=env_float("ON_TIME_RATIO", 1.0),
+    parser.add_argument("--ratio", type=float,
                         help="минимальная доля оплат вовремя, 0..1 (env ON_TIME_RATIO, по умолчанию 1.0)")
     parser.add_argument("--min-payments", type=int, default=1,
-                        help="минимальное число оплат клиента для попадания в отчёт (по умолчанию 1)")
-    parser.add_argument("--grace-days", type=int, default=int(env_float("GRACE_DAYS", 0)),
+                        help="минимальное число поступивших оплат клиента (по умолчанию 1)")
+    parser.add_argument("--grace-days", type=int,
                         help="допустимая задержка в днях (env GRACE_DAYS, по умолчанию 0)")
     parser.add_argument("--range-start", help="начало периода операций, YYYY-MM-DD")
     parser.add_argument("--range-end", help="конец периода операций, YYYY-MM-DD")
@@ -209,6 +219,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--csv", help="сохранить результат в CSV-файл")
     parser.add_argument("-v", "--verbose", action="store_true", help="показать просрочки по клиентам")
     args = parser.parse_args(argv)
+    args.ratio = resolve_option(parser, args.ratio, "ON_TIME_RATIO", 1.0, float)
+    args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, int)
 
     token = os.getenv("ADESK_API_TOKEN")
     if not token:
@@ -229,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
 
     stats = evaluate(contractors, deals, transactions, grace_days=args.grace_days)
     good = sorted(
-        (s for s in stats.values() if s.total >= args.min_payments and s.ratio >= args.ratio),
+        (s for s in stats.values() if s.paid >= args.min_payments and s.ratio >= args.ratio),
         key=lambda s: (-s.ratio, -s.total, s.name.lower()),
     )
 
@@ -238,7 +250,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{'ID':>8}  {'Клиент':<40} {'Вовремя':>8} {'Всего':>6} {'Доля':>6}")
     for s in good:
         print(f"{s.client_id!s:>8}  {s.name[:40]:<40} {s.on_time:>8} {s.total:>6} {s.ratio:>6.0%}")
-        if args.verbose:
+
+    if args.verbose:
+        late_clients = sorted((s for s in stats.values() if s.late_details),
+                              key=lambda s: s.name.lower())
+        print(f"\nПросроченные оплаты ({len(late_clients)} клиентов):")
+        for s in late_clients:
+            print(f"{s.client_id!s:>8}  {s.name[:40]:<40} вовремя {s.on_time} из {s.total} ({s.ratio:.0%})")
             for line in s.late_details:
                 print(f"{'':>10}- {line}")
 
