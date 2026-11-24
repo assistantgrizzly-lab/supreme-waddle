@@ -13,10 +13,17 @@
     общее число записей — recordsFiltered.
 
 Логика сравнения дат по каждой операции поступления клиента:
-  * фактическая операция (isPlanned = false): факт = date, срок = relatedDate
-    (дата начисления), если её нет — endDate сделки, к которой привязана
-    операция. Оплата вовремя, если date <= срок + GRACE_DAYS.
-    Операции без срока в расчёт не попадают.
+  * фактическая операция (isPlanned = false): факт = date. Оплата — аванс за
+    месяц начисления, поэтому срок = день перед relatedDate (дата начисления,
+    только при hasAccrual = true); если начисления нет — endDate сделки,
+    к которой привязана операция. Клиенты из POSTPAID_CLIENTS платят за прошлый
+    месяц: срок = последний день месяца, следующего за месяцем начисления.
+    Клиенты из SAME_MONTH_CLIENTS платят месяц в месяц: срок = последний день
+    месяца начисления. Если клиент в обоих списках, действует POSTPAID_CLIENTS.
+    Оплата вовремя, если date <= срок + GRACE_DAYS.
+    Операции без срока в расчёт не попадают. Исходную плановую дату Adesk
+    при подтверждении операции перезаписывает, поэтому API её не отдаёт.
+  * --categories / CATEGORY_IDS: учитываются только операции этих статей.
   * плановая операция (isPlanned = true) с date + GRACE_DAYS < сегодня —
     оплата не поступила в срок (просрочка).
 """
@@ -24,6 +31,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import os
 import sys
@@ -129,6 +137,7 @@ class ClientStats:
     name: str
     on_time: int = 0
     late: int = 0
+    paid: int = 0
     late_details: list[str] = field(default_factory=list)
 
     @property
@@ -144,10 +153,18 @@ def _id(obj: Any) -> Any:
     return obj.get("id") if isinstance(obj, dict) else obj
 
 
+def end_of_month(d: date, months_ahead: int = 0) -> date:
+    year, month = divmod(d.year * 12 + d.month - 1 + months_ahead, 12)
+    return date(year, month + 1, calendar.monthrange(year, month + 1)[1])
+
+
 def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
              transactions: list[dict[str, Any]], today: date | None = None,
-             grace_days: int = 0) -> dict[Any, ClientStats]:
+             grace_days: int = 0, postpaid: set[str] | None = None,
+             same_month: set[str] | None = None) -> dict[Any, ClientStats]:
     today = today or date.today()
+    postpaid = postpaid or set()
+    same_month = same_month or set()
     grace = timedelta(days=grace_days)
     names = {c["id"]: c.get("name") or str(c["id"]) for c in contractors if "id" in c}
     deals_by_id = {d["id"]: d for d in deals if "id" in d}
@@ -178,10 +195,19 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
                 s.late_details.append(f"операция {tx.get('id')}: план {tx_date}, оплаты нет")
             continue
 
-        due = parse_date(tx.get("relatedDate")) or parse_date((deal or {}).get("endDate"))
+        accrual = parse_date(tx.get("relatedDate")) if tx.get("hasAccrual", True) else None
+        if accrual is None:
+            due = parse_date((deal or {}).get("endDate"))
+        elif str(cid) in postpaid:
+            due = end_of_month(accrual, 1)
+        elif str(cid) in same_month:
+            due = end_of_month(accrual)
+        else:
+            due = accrual - timedelta(days=1)
         if due is None:
             continue
         s = client_stats(cid, fallback)
+        s.paid += 1
         if tx_date <= due + grace:
             s.on_time += 1
         else:
@@ -190,25 +216,56 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
     return stats
 
 
-def env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    return float(raw) if raw not in (None, "") else default
+def whole_days(raw: str) -> int:
+    value = float(raw)
+    if not value.is_integer() or not 0 <= value <= 36500:
+        raise ValueError(f"ожидается целое число дней от 0 до 36500: {raw!r}")
+    return int(value)
+
+
+def id_list(value: str | None, env_name: str) -> set[str]:
+    raw = value if value is not None else os.getenv(env_name, "")
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def resolve_option(parser: argparse.ArgumentParser, value: Any, env_name: str,
+                   default: Any, cast: Any) -> Any:
+    if value is not None:
+        return value
+    raw = os.getenv(env_name)
+    if raw in (None, ""):
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        parser.error(f"некорректное значение {env_name}={raw!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Клиенты Adesk, оплачивающие вовремя.")
-    parser.add_argument("--ratio", type=float, default=env_float("ON_TIME_RATIO", 1.0),
+    parser.add_argument("--ratio", type=float,
                         help="минимальная доля оплат вовремя, 0..1 (env ON_TIME_RATIO, по умолчанию 1.0)")
     parser.add_argument("--min-payments", type=int, default=1,
-                        help="минимальное число оплат клиента для попадания в отчёт (по умолчанию 1)")
-    parser.add_argument("--grace-days", type=int, default=int(env_float("GRACE_DAYS", 0)),
+                        help="минимальное число поступивших оплат клиента (по умолчанию 1)")
+    parser.add_argument("--grace-days", type=whole_days,
                         help="допустимая задержка в днях (env GRACE_DAYS, по умолчанию 0)")
+    parser.add_argument("--postpaid",
+                        help="ID клиентов через запятую, которые платят за прошлый месяц (env POSTPAID_CLIENTS)")
+    parser.add_argument("--same-month",
+                        help="ID клиентов через запятую, которые платят месяц в месяц (env SAME_MONTH_CLIENTS)")
+    parser.add_argument("--categories",
+                        help="ID статей через запятую; учитывать только их операции (env CATEGORY_IDS)")
     parser.add_argument("--range-start", help="начало периода операций, YYYY-MM-DD")
     parser.add_argument("--range-end", help="конец периода операций, YYYY-MM-DD")
     parser.add_argument("--page-size", type=int, default=100, help="размер страницы (length)")
     parser.add_argument("--csv", help="сохранить результат в CSV-файл")
     parser.add_argument("-v", "--verbose", action="store_true", help="показать просрочки по клиентам")
     args = parser.parse_args(argv)
+    args.ratio = resolve_option(parser, args.ratio, "ON_TIME_RATIO", 1.0, float)
+    args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, whole_days)
+    postpaid = id_list(args.postpaid, "POSTPAID_CLIENTS")
+    same_month = id_list(args.same_month, "SAME_MONTH_CLIENTS")
+    categories = id_list(args.categories, "CATEGORY_IDS")
 
     token = os.getenv("ADESK_API_TOKEN")
     if not token:
@@ -227,9 +284,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ошибка Adesk API: {exc}", file=sys.stderr)
         return 1
 
-    stats = evaluate(contractors, deals, transactions, grace_days=args.grace_days)
+    if categories:
+        transactions = [t for t in transactions if str(_id(t.get("category"))) in categories]
+    stats = evaluate(contractors, deals, transactions, grace_days=args.grace_days,
+                     postpaid=postpaid, same_month=same_month)
     good = sorted(
-        (s for s in stats.values() if s.total >= args.min_payments and s.ratio >= args.ratio),
+        (s for s in stats.values() if s.paid >= args.min_payments and s.ratio >= args.ratio),
         key=lambda s: (-s.ratio, -s.total, s.name.lower()),
     )
 
@@ -238,7 +298,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{'ID':>8}  {'Клиент':<40} {'Вовремя':>8} {'Всего':>6} {'Доля':>6}")
     for s in good:
         print(f"{s.client_id!s:>8}  {s.name[:40]:<40} {s.on_time:>8} {s.total:>6} {s.ratio:>6.0%}")
-        if args.verbose:
+
+    if args.verbose:
+        late_clients = sorted((s for s in stats.values() if s.late_details),
+                              key=lambda s: s.name.lower())
+        print(f"\nПросроченные оплаты ({len(late_clients)} клиентов):")
+        for s in late_clients:
+            print(f"{s.client_id!s:>8}  {s.name[:40]:<40} вовремя {s.on_time} из {s.total} ({s.ratio:.0%})")
             for line in s.late_details:
                 print(f"{'':>10}- {line}")
 
