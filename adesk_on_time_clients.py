@@ -13,10 +13,12 @@
     общее число записей — recordsFiltered.
 
 Логика сравнения дат по каждой операции поступления клиента:
-  * фактическая операция (isPlanned = false): факт = date, срок = relatedDate
-    (дата начисления), если её нет — endDate сделки, к которой привязана
-    операция. Оплата вовремя, если date <= срок + GRACE_DAYS.
-    Операции без срока в расчёт не попадают.
+  * фактическая операция (isPlanned = false): факт = date. Оплата — аванс за
+    месяц начисления, поэтому срок = день перед relatedDate (дата начисления,
+    только при hasAccrual = true); если начисления нет — endDate сделки,
+    к которой привязана операция. Оплата вовремя, если date <= срок + GRACE_DAYS.
+    Операции без срока в расчёт не попадают. Исходную плановую дату Adesk
+    при подтверждении операции перезаписывает, поэтому API её не отдаёт.
   * плановая операция (isPlanned = true) с date + GRACE_DAYS < сегодня —
     оплата не поступила в срок (просрочка).
 """
@@ -179,7 +181,8 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
                 s.late_details.append(f"операция {tx.get('id')}: план {tx_date}, оплаты нет")
             continue
 
-        due = parse_date(tx.get("relatedDate")) or parse_date((deal or {}).get("endDate"))
+        accrual = parse_date(tx.get("relatedDate")) if tx.get("hasAccrual", True) else None
+        due = accrual - timedelta(days=1) if accrual else parse_date((deal or {}).get("endDate"))
         if due is None:
             continue
         s = client_stats(cid, fallback)
