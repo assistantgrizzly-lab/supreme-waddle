@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="показать просрочки по клиентам")
     args = parser.parse_args(argv)
     args.ratio = resolve_option(parser, args.ratio, "ON_TIME_RATIO", 1.0, float)
-    args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, int)
+    args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, lambda v: int(float(v)))
 
     token = os.getenv("ADESK_API_TOKEN")
     if not token:
