@@ -16,7 +16,9 @@
   * фактическая операция (isPlanned = false): факт = date. Оплата — аванс за
     месяц начисления, поэтому срок = день перед relatedDate (дата начисления,
     только при hasAccrual = true); если начисления нет — endDate сделки,
-    к которой привязана операция. Оплата вовремя, если date <= срок + GRACE_DAYS.
+    к которой привязана операция. Клиенты из POSTPAID_CLIENTS платят за прошлый
+    месяц: срок = последний день месяца, следующего за месяцем начисления.
+    Оплата вовремя, если date <= срок + GRACE_DAYS.
     Операции без срока в расчёт не попадают. Исходную плановую дату Adesk
     при подтверждении операции перезаписывает, поэтому API её не отдаёт.
   * плановая операция (isPlanned = true) с date + GRACE_DAYS < сегодня —
@@ -26,6 +28,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import os
 import sys
@@ -147,10 +150,16 @@ def _id(obj: Any) -> Any:
     return obj.get("id") if isinstance(obj, dict) else obj
 
 
+def end_of_next_month(d: date) -> date:
+    year, month = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+    return date(year, month, calendar.monthrange(year, month)[1])
+
+
 def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
              transactions: list[dict[str, Any]], today: date | None = None,
-             grace_days: int = 0) -> dict[Any, ClientStats]:
+             grace_days: int = 0, postpaid: set[str] | None = None) -> dict[Any, ClientStats]:
     today = today or date.today()
+    postpaid = postpaid or set()
     grace = timedelta(days=grace_days)
     names = {c["id"]: c.get("name") or str(c["id"]) for c in contractors if "id" in c}
     deals_by_id = {d["id"]: d for d in deals if "id" in d}
@@ -182,7 +191,12 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
             continue
 
         accrual = parse_date(tx.get("relatedDate")) if tx.get("hasAccrual", True) else None
-        due = accrual - timedelta(days=1) if accrual else parse_date((deal or {}).get("endDate"))
+        if accrual is None:
+            due = parse_date((deal or {}).get("endDate"))
+        elif str(cid) in postpaid:
+            due = end_of_next_month(accrual)
+        else:
+            due = accrual - timedelta(days=1)
         if due is None:
             continue
         s = client_stats(cid, fallback)
@@ -223,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="минимальное число поступивших оплат клиента (по умолчанию 1)")
     parser.add_argument("--grace-days", type=whole_days,
                         help="допустимая задержка в днях (env GRACE_DAYS, по умолчанию 0)")
+    parser.add_argument("--postpaid",
+                        help="ID клиентов через запятую, которые платят за прошлый месяц (env POSTPAID_CLIENTS)")
     parser.add_argument("--range-start", help="начало периода операций, YYYY-MM-DD")
     parser.add_argument("--range-end", help="конец периода операций, YYYY-MM-DD")
     parser.add_argument("--page-size", type=int, default=100, help="размер страницы (length)")
@@ -231,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     args.ratio = resolve_option(parser, args.ratio, "ON_TIME_RATIO", 1.0, float)
     args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, whole_days)
+    postpaid_raw = args.postpaid if args.postpaid is not None else os.getenv("POSTPAID_CLIENTS", "")
+    postpaid = {x.strip() for x in postpaid_raw.split(",") if x.strip()}
 
     token = os.getenv("ADESK_API_TOKEN")
     if not token:
@@ -249,7 +267,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ошибка Adesk API: {exc}", file=sys.stderr)
         return 1
 
-    stats = evaluate(contractors, deals, transactions, grace_days=args.grace_days)
+    stats = evaluate(contractors, deals, transactions, grace_days=args.grace_days,
+                     postpaid=postpaid)
     good = sorted(
         (s for s in stats.values() if s.paid >= args.min_payments and s.ratio >= args.ratio),
         key=lambda s: (-s.ratio, -s.total, s.name.lower()),
