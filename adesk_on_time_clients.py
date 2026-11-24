@@ -18,6 +18,8 @@
     только при hasAccrual = true); если начисления нет — endDate сделки,
     к которой привязана операция. Клиенты из POSTPAID_CLIENTS платят за прошлый
     месяц: срок = последний день месяца, следующего за месяцем начисления.
+    Клиенты из SAME_MONTH_CLIENTS платят месяц в месяц: срок = последний день
+    месяца начисления. Если клиент в обоих списках, действует POSTPAID_CLIENTS.
     Оплата вовремя, если date <= срок + GRACE_DAYS.
     Операции без срока в расчёт не попадают. Исходную плановую дату Adesk
     при подтверждении операции перезаписывает, поэтому API её не отдаёт.
@@ -150,16 +152,18 @@ def _id(obj: Any) -> Any:
     return obj.get("id") if isinstance(obj, dict) else obj
 
 
-def end_of_next_month(d: date) -> date:
-    year, month = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
-    return date(year, month, calendar.monthrange(year, month)[1])
+def end_of_month(d: date, months_ahead: int = 0) -> date:
+    year, month = divmod(d.year * 12 + d.month - 1 + months_ahead, 12)
+    return date(year, month + 1, calendar.monthrange(year, month + 1)[1])
 
 
 def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
              transactions: list[dict[str, Any]], today: date | None = None,
-             grace_days: int = 0, postpaid: set[str] | None = None) -> dict[Any, ClientStats]:
+             grace_days: int = 0, postpaid: set[str] | None = None,
+             same_month: set[str] | None = None) -> dict[Any, ClientStats]:
     today = today or date.today()
     postpaid = postpaid or set()
+    same_month = same_month or set()
     grace = timedelta(days=grace_days)
     names = {c["id"]: c.get("name") or str(c["id"]) for c in contractors if "id" in c}
     deals_by_id = {d["id"]: d for d in deals if "id" in d}
@@ -194,7 +198,9 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
         if accrual is None:
             due = parse_date((deal or {}).get("endDate"))
         elif str(cid) in postpaid:
-            due = end_of_next_month(accrual)
+            due = end_of_month(accrual, 1)
+        elif str(cid) in same_month:
+            due = end_of_month(accrual)
         else:
             due = accrual - timedelta(days=1)
         if due is None:
@@ -214,6 +220,11 @@ def whole_days(raw: str) -> int:
     if not value.is_integer() or not 0 <= value <= 36500:
         raise ValueError(f"ожидается целое число дней от 0 до 36500: {raw!r}")
     return int(value)
+
+
+def id_list(value: str | None, env_name: str) -> set[str]:
+    raw = value if value is not None else os.getenv(env_name, "")
+    return {x.strip() for x in raw.split(",") if x.strip()}
 
 
 def resolve_option(parser: argparse.ArgumentParser, value: Any, env_name: str,
@@ -239,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="допустимая задержка в днях (env GRACE_DAYS, по умолчанию 0)")
     parser.add_argument("--postpaid",
                         help="ID клиентов через запятую, которые платят за прошлый месяц (env POSTPAID_CLIENTS)")
+    parser.add_argument("--same-month",
+                        help="ID клиентов через запятую, которые платят месяц в месяц (env SAME_MONTH_CLIENTS)")
     parser.add_argument("--range-start", help="начало периода операций, YYYY-MM-DD")
     parser.add_argument("--range-end", help="конец периода операций, YYYY-MM-DD")
     parser.add_argument("--page-size", type=int, default=100, help="размер страницы (length)")
@@ -247,8 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     args.ratio = resolve_option(parser, args.ratio, "ON_TIME_RATIO", 1.0, float)
     args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, whole_days)
-    postpaid_raw = args.postpaid if args.postpaid is not None else os.getenv("POSTPAID_CLIENTS", "")
-    postpaid = {x.strip() for x in postpaid_raw.split(",") if x.strip()}
+    postpaid = id_list(args.postpaid, "POSTPAID_CLIENTS")
+    same_month = id_list(args.same_month, "SAME_MONTH_CLIENTS")
 
     token = os.getenv("ADESK_API_TOKEN")
     if not token:
@@ -268,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     stats = evaluate(contractors, deals, transactions, grace_days=args.grace_days,
-                     postpaid=postpaid)
+                     postpaid=postpaid, same_month=same_month)
     good = sorted(
         (s for s in stats.values() if s.paid >= args.min_payments and s.ratio >= args.ratio),
         key=lambda s: (-s.ratio, -s.total, s.name.lower()),
