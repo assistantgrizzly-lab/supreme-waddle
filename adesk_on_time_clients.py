@@ -192,6 +192,13 @@ def evaluate(contractors: list[dict[str, Any]], deals: list[dict[str, Any]],
     return stats
 
 
+def whole_days(raw: str) -> int:
+    value = float(raw)
+    if not value.is_integer() or not 0 <= value <= 36500:
+        raise ValueError(f"ожидается целое число дней от 0 до 36500: {raw!r}")
+    return int(value)
+
+
 def resolve_option(parser: argparse.ArgumentParser, value: Any, env_name: str,
                    default: Any, cast: Any) -> Any:
     if value is not None:
@@ -211,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="минимальная доля оплат вовремя, 0..1 (env ON_TIME_RATIO, по умолчанию 1.0)")
     parser.add_argument("--min-payments", type=int, default=1,
                         help="минимальное число поступивших оплат клиента (по умолчанию 1)")
-    parser.add_argument("--grace-days", type=int,
+    parser.add_argument("--grace-days", type=whole_days,
                         help="допустимая задержка в днях (env GRACE_DAYS, по умолчанию 0)")
     parser.add_argument("--range-start", help="начало периода операций, YYYY-MM-DD")
     parser.add_argument("--range-end", help="конец периода операций, YYYY-MM-DD")
@@ -220,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="показать просрочки по клиентам")
     args = parser.parse_args(argv)
     args.ratio = resolve_option(parser, args.ratio, "ON_TIME_RATIO", 1.0, float)
-    args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, lambda v: int(float(v)))
+    args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, whole_days)
 
     token = os.getenv("ADESK_API_TOKEN")
     if not token:
