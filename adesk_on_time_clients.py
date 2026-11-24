@@ -23,6 +23,7 @@
     Оплата вовремя, если date <= срок + GRACE_DAYS.
     Операции без срока в расчёт не попадают. Исходную плановую дату Adesk
     при подтверждении операции перезаписывает, поэтому API её не отдаёт.
+  * --categories / CATEGORY_IDS: учитываются только операции этих статей.
   * плановая операция (isPlanned = true) с date + GRACE_DAYS < сегодня —
     оплата не поступила в срок (просрочка).
 """
@@ -252,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="ID клиентов через запятую, которые платят за прошлый месяц (env POSTPAID_CLIENTS)")
     parser.add_argument("--same-month",
                         help="ID клиентов через запятую, которые платят месяц в месяц (env SAME_MONTH_CLIENTS)")
+    parser.add_argument("--categories",
+                        help="ID статей через запятую; учитывать только их операции (env CATEGORY_IDS)")
     parser.add_argument("--range-start", help="начало периода операций, YYYY-MM-DD")
     parser.add_argument("--range-end", help="конец периода операций, YYYY-MM-DD")
     parser.add_argument("--page-size", type=int, default=100, help="размер страницы (length)")
@@ -262,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     args.grace_days = resolve_option(parser, args.grace_days, "GRACE_DAYS", 0, whole_days)
     postpaid = id_list(args.postpaid, "POSTPAID_CLIENTS")
     same_month = id_list(args.same_month, "SAME_MONTH_CLIENTS")
+    categories = id_list(args.categories, "CATEGORY_IDS")
 
     token = os.getenv("ADESK_API_TOKEN")
     if not token:
@@ -280,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ошибка Adesk API: {exc}", file=sys.stderr)
         return 1
 
+    if categories:
+        transactions = [t for t in transactions if str(_id(t.get("category"))) in categories]
     stats = evaluate(contractors, deals, transactions, grace_days=args.grace_days,
                      postpaid=postpaid, same_month=same_month)
     good = sorted(

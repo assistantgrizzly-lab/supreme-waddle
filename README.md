@@ -27,6 +27,7 @@ python adesk_on_time_clients.py
 | `--grace-days 3` | допустимая задержка в днях (или env `GRACE_DAYS`) |
 | `--postpaid 666454,639561` | ID клиентов, которые платят за прошлый месяц (или env `POSTPAID_CLIENTS`) |
 | `--same-month 6023056,639582` | ID клиентов, которые платят месяц в месяц (или env `SAME_MONTH_CLIENTS`) |
+| `--categories 308309,1806797` | учитывать только операции этих статей, ID через запятую (или env `CATEGORY_IDS`) |
 | `--min-payments 3` | минимальное число поступивших оплат у клиента |
 | `--range-start 2025-01-01 --range-end 2025-12-31` | период операций |
 | `--csv result.csv` | сохранить результат в CSV |
